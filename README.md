@@ -8,7 +8,7 @@
 
 [打开 OpenAI DevDay 2026 中英图文阅读](https://keynotes-examples.pages.dev/)
 
-约 53 分钟的完整发布会，整理为 107 个阅读单元，包含 111 张截图、英文演讲稿和中文译稿。每页的时间链接可回查[原视频](https://www.youtube.com/watch?v=Fls_onRviPM)，「对照改动」可查看英文整理前后的变化。
+完整整理约 53 分钟的来源视频，得到 107 个阅读单元，包含 111 张截图、英文演讲稿和中文译稿。每页的时间链接可回查[原视频](https://www.youtube.com/watch?v=Fls_onRviPM)，「对照改动」可查看英文整理前后的变化。
 
 [![示例第 57–59 页：PPT、英文演讲稿与中文译稿](assets/example-reading.jpg)](https://keynotes-examples.pages.dev/)
 
@@ -37,11 +37,11 @@ cp -R references scripts ~/.codex/skills/speech-transcript-organizer/
 
 ## 使用条件
 
-适用于支持 Skill、长程任务、文件读写和本地工具的 Agent，包括 Codex、Claude Code、Workbuddy、千问办公和豆包工作。视频与图片任务需要实际图片输入能力，能读取页面中的文字、图表和布局变化。
+视频与图片任务需要图片读取能力，能读取页面中的文字、图表和布局变化。
 
 文字整理工具使用 Python 3.10+；视频处理按需使用 ffmpeg/ffprobe，本地听写按需使用 whisper.cpp 和兼容模型。具体条件见 [前置检查](references/prerequisites.md)。
 
-已有使用记录覆盖 Codex 中约 10 分钟及 53 分钟英文视频的逐页整理、中英交付和图文关联检查。上方在线示例来自完整的 53 分钟视频整理结果。
+已在 Codex 和 Claude Code 上验证。
 
 ## 使用与免责声明
 
