@@ -10,6 +10,8 @@
 
 约 53 分钟的完整发布会，整理为 107 个阅读单元，包含 111 张截图、英文演讲稿和中文译稿。每页的时间链接可回查[原视频](https://www.youtube.com/watch?v=Fls_onRviPM)，「对照改动」可查看英文整理前后的变化。
 
+[![示例第 57–59 页：PPT、英文演讲稿与中文译稿](assets/example-reading.jpg)](https://keynotes-examples.pages.dev/)
+
 ## 安装与使用
 
 下载本仓库，保留 `SKILL.md`、`references/` 和 `scripts/` 的结构。在 Codex 中，默认安装位置为 `~/.codex/skills/speech-transcript-organizer/`；从下载后的仓库根目录执行：
