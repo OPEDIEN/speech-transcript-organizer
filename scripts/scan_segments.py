@@ -11,6 +11,12 @@
     长时间恒定能量、无任何停顿    → 配乐 / 会场底噪 / 演示视频
     长时间低于静音门限            → 静音
 
+判据里那个静音门限是**绝对 dB，换录音不一定合适**：音频被压过的直播流上，句间停顿
+可能整片落不到门限以下，正常演讲会被整段误判成「恒定能量」。实测**任何全局门限都分不开**
+（某直播流的语音停顿只落到 −45 dB，而另一片素材的配乐谷底是 −46 dB，可用窗口不到 1 dB）。
+所以脚本不假装能分开，而是**自检「本片判据到底可不可用」**（人声段 vs 恒定能量段的
+动态范围之比，需 ≥1.5×），不可靠时整体降级、只报一条说明 + 一行待判断段落清单。
+
 只在本地读音频，不写任何中间文件，不上传。只用标准库。
 
 用法：
@@ -95,7 +101,45 @@ def stats_for(frames, a, b):
             "db_p95": round(pick(0.95), 1), "db_spread": round(pick(0.95) - pick(0.05), 1)}
 
 
-def classify(frames, silence_db, pause_min, min_sustained, min_silence):
+def calibrate(regions):
+    """本片「停顿结构」判据到底可不可用 —— 用人声段与恒定能量段的动态范围之比自检。
+
+    区分度够（人声 spread 明显宽于恒定能量 spread）时，逐段结论可信；
+    不够时（压缩过的直播流常见）**任何阈值都分不开**，只能整体降级、请人工判断，
+    而不是硬报一堆可疑段。
+    """
+    sp = sorted(r["db_spread"] for r in regions
+                if r["kind"] == "speech" and r.get("db_spread") is not None)
+    su = sorted(r["db_spread"] for r in regions
+                if r["kind"] == "sustained" and r.get("db_spread") is not None)
+    med = lambda xs: (xs[len(xs) // 2] if xs else None)
+    S, U = med(sp), med(su)
+    if S is None or U is None or U <= 0:
+        return {"speech_spread_median": S, "sustained_spread_median": U,
+                "ratio": None, "reliable": True}
+    ratio = S / U
+    return {"speech_spread_median": S, "sustained_spread_median": U,
+            "ratio": round(ratio, 2), "reliable": ratio >= 1.5}
+
+
+def merge_adjacent(spans, gap):
+    """把中间只隔一小会儿（< gap 秒）的相邻区间并成一段。
+
+    同一段配乐/演示里常夹着零点几秒的伪停顿，会被切成好几段连报
+    （实测一次扫描出现 591.8–622.0 / 622.4–645.4 / 646.0–688.4 三段，本就是一段）。
+    """
+    if not spans:
+        return []
+    out = [list(spans[0])]
+    for a, b in spans[1:]:
+        if a - out[-1][1] < gap:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def classify(frames, silence_db, pause_min, min_sustained, min_silence, merge_gap=2.0):
     """按「能量 + 停顿结构」切段。
 
     关键是**先按停顿切开，再找无停顿的长段**。
@@ -115,6 +159,7 @@ def classify(frames, silence_db, pause_min, min_sustained, min_silence):
         cursor = max(cursor, b)
     if t1 - cursor >= min_sustained:
         sustained.append((cursor, t1))
+    sustained = merge_adjacent(sustained, merge_gap)
 
     # 剩下的就是人声。报告静音段时只算 ≥ min_silence 的：
     # 词间那些 0.1–0.3s 的小停顿属于正常说话，算进静音会让占比虚高。
@@ -147,93 +192,147 @@ def attach_asr(regions, segments_path):
         segs = json.load(f)["segments"]
     for r in regions:
         inside = [s for s in segs
-                  if s["start"] < r["end"] and s["end"] > r["start"]]
+                  if r["start"] <= (s["start"] + s["end"]) / 2 < r["end"]]
         r["asr_segments"] = len(inside)
         r["asr_chars"] = sum(len(s["text"]) for s in inside)
         r["asr_sample"] = "".join(s["text"] for s in inside)[:40]
     return segs
 
 
-def findings(regions, min_sustained, min_missing):
+def findings(regions, min_sustained, min_missing, cal=None):
+    """把候选段翻成人看的结论。
+
+    `cal` 是 `calibrate()` 的结果。判据不可靠时**不再逐段报可疑**——那种录音上
+    正常演讲本来就会被切成「恒定能量」，逐条报警只会淹没真正需要看的段落。
+    """
+    cal = cal or {}
+    reliable = cal.get("reliable", True)
     out = []
+    sustained = [r for r in regions if r["kind"] == "sustained"]
+    if sustained and not reliable:
+        out.append(
+            "⚠ Pause-structure test unreliable on this recording: median spread %s dB (speech) "
+            "vs %s dB (steady energy), separation only %sx (need >= 1.5x). Common on compressed "
+            "live streams — **no global silence threshold can separate them**. The %d stretches "
+            "below have no inter-sentence pauses; judge them by hand rather than assuming music "
+            "or ASR hallucination."
+            % (cal.get("speech_spread_median"), cal.get("sustained_spread_median"),
+               cal.get("ratio"), len(sustained)))
+        listed = ", ".join("%.0f–%.0fs" % (r["start"], r["end"]) for r in sustained[:12])
+        if len(sustained) > 12:
+            listed += " ... (%d total)" % len(sustained)
+        out.append("   · stretches to judge by hand: " + listed)
     for r in regions:
         has_asr = r.get("asr_segments") is not None
-        if r["kind"] == "sustained" and has_asr and r["asr_segments"]:
-            out.append("⚠ %.1f–%.1fs（%.0fs）连续能量段里却有 %d 段转写文本：%r\n"
-                       "     可能是人声叠在掌声/配乐上（文本为真），也可能是 ASR 在纯配乐上的幻觉。\n"
-                       "     能量统计不足以区分两者，必须回听确认。"
-                       % (r["start"], r["end"], r["duration"], r["asr_segments"], r["asr_sample"]))
-        elif r["kind"] == "sustained":
+        if r["kind"] == "sustained":
+            if not reliable:
+                continue          # 已在上面用一条总说明 + 一行清单交代，不再逐段刷屏
             spread = r.get("db_spread")
-            if spread is not None and spread > 35:
-                out.append("⚠ %.1f–%.1fs（%.0fs）无句间停顿，但动态范围 %.0f dB 偏大 —— "
-                           "可能是长时间连续说话而非配乐，需回听"
-                           % (r["start"], r["end"], r["duration"], spread))
-            else:
-                out.append("· %.1f–%.1fs（%.0fs）恒定能量、无句间停顿（动态范围 %.0f dB）"
-                           "→ 候选，需结合画面与回听确认"
+            # 动态范围窄 → 像配乐/底噪；宽 → 像连续说话。阈值 35 dB 只在判据可靠时有意义。
+            music_like = spread is None or spread <= 35
+            if music_like and has_asr and r["asr_segments"]:
+                out.append("⚠ %.1f–%.1fs (%.0fs) steady energy but %d transcript segment(s): %r\n"
+                           "     Could be speech over applause/music (the text is real), or ASR\n"
+                           "     hallucination over music alone. The two are indistinguishable from\n"
+                           "     audio (both measure ~20 dB spread); listen to confirm."
+                           % (r["start"], r["end"], r["duration"], r["asr_segments"], r["asr_sample"]))
+            elif music_like:
+                out.append("· %.1f–%.1fs (%.0fs) steady energy, no inter-sentence pauses "
+                           "(spread %.0f dB) -> music / room tone / demo video"
                            % (r["start"], r["end"], r["duration"], spread if spread is not None else -1))
+            else:
+                out.append("⚠ %.1f–%.1fs (%.0fs) no inter-sentence pauses, but spread %.0f dB is "
+                           "wide — possibly continuous speech rather than music; listen to confirm"
+                           % (r["start"], r["end"], r["duration"], spread))
         elif r["kind"] == "speech" and has_asr and not r["asr_segments"] and r["duration"] >= min_missing:
-            out.append("⚠ %.1f–%.1fs（%.0fs）有波动能量但转写稿无文本 —— 疑似漏转写，需回听"
+            out.append("⚠ %.1f–%.1fs (%.0fs) speech-like energy but no transcript text — "
+                       "possibly missed transcription; listen to confirm"
                        % (r["start"], r["end"], r["duration"]))
     return out
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="扫描音轨，找出演示段/配乐/静音候选")
+    ap = argparse.ArgumentParser(
+        description="Scan the audio track for demo segments, music and silence")
     ap.add_argument("media")
-    ap.add_argument("--segments", help="segments.json，用于核对候选段有没有转写文本")
-    ap.add_argument("--out", help="把结构化结果写到这个 JSON")
+    ap.add_argument("--segments", help="segments.json, to check candidates against transcript text")
+    ap.add_argument("--out", help="write the structured result to this JSON file")
     ap.add_argument("--ffmpeg", default=os.getenv("LOCAL_ASR_FFMPEG"))
-    ap.add_argument("--silence-db", type=float, default=-50.0, help="静音门限（dBFS，默认 -50）")
-    ap.add_argument("--pause-min", type=float, default=0.25, help="多长的下降算句间停顿（秒，默认 0.25）")
+    ap.add_argument("--silence-db", type=float, default=-50.0,
+                    help="silence threshold (dBFS, default -50). **Absolute — may not fit another "
+                         "recording**: on a compressed live stream it can fail across the whole "
+                         "file, so the script also self-checks whether the test applies and degrades")
+    ap.add_argument("--merge-gap", type=float, default=2.0,
+                    help="merge adjacent steady-energy stretches separated by less than this (s)")
+    ap.add_argument("--pause-min", type=float, default=0.25,
+                    help="how long a dip must be to count as an inter-sentence pause (s)")
     ap.add_argument("--min-sustained", type=float, default=20.0,
-                    help="多长的无停顿段算持续音频（秒，默认 20）")
+                    help="how long a pause-free stretch must be to count as steady energy (s)")
     ap.add_argument("--min-silence", type=float, default=1.0,
-                    help="多长的低能量段才作为「静音段」报告（秒，默认 1.0；更短的是词间停顿）")
+                    help="how long a low-energy stretch must be to be reported as silence (s)")
     ap.add_argument("--min-missing", type=float, default=10.0,
-                    help="多长的人声段没文本才报漏转写（秒，默认 10）")
+                    help="how long a speech stretch without text must be to report a miss (s)")
     args = ap.parse_args()
 
-    if any(v <= 0 for v in (args.pause_min, args.min_sustained, args.min_silence, args.min_missing)):
+    # 时长类阈值必须为正：0 或负数会让分类逻辑把整片判成一段，结论完全失真
+    if any(v <= 0 for v in (args.pause_min, args.min_sustained,
+                            args.min_silence, args.min_missing)):
         ap.error("duration thresholds must be positive")
     if not os.path.isfile(args.media):
         raise SystemExit(f"media not found: {args.media}")
     ffmpeg = require("ffmpeg", args.ffmpeg)
 
     frames = envelope(ffmpeg, args.media)
-    regions = classify(frames, args.silence_db, args.pause_min, args.min_sustained, args.min_silence)
+    silence_db = args.silence_db
+    regions = classify(frames, silence_db, args.pause_min, args.min_sustained,
+                       args.min_silence, args.merge_gap)
     attach_asr(regions, args.segments)
-    notes = findings(regions, args.min_sustained, args.min_missing)
+    cal = calibrate(regions)
+    notes = findings(regions, args.min_sustained, args.min_missing, cal)
 
     speech = sum(r["duration"] for r in regions if r["kind"] == "speech")
     sustained = sum(r["duration"] for r in regions if r["kind"] == "sustained")
     silence = sum(r["duration"] for r in regions if r["kind"] == "silence")
     total = frames[-1][0] or 1.0
 
-    print("音轨扫描：%s" % args.media)
-    print("  帧数 %d（约 %.0f ms/帧）  覆盖 %.1fs" % (len(frames), 1000 * total / len(frames), total))
-    print("  人声 %.1fs（%.0f%%）｜ 恒定能量 %.1fs（%.0f%%）｜ 静音 %.1fs（%.0f%%）"
+    def num(x, fmt="%.1f"):
+        return "—" if x is None else fmt % x
+
+    print("Audio scan: %s" % args.media)
+    print("  %d frames (~%.0f ms/frame)  covering %.1fs"
+          % (len(frames), 1000 * total / len(frames), total))
+    print("  silence threshold %.1f dBFS (absolute; may not fit another recording)" % silence_db)
+    print("  test self-check: speech spread median %s dB | steady energy %s dB | separation %sx -> %s"
+          % (num(cal["speech_spread_median"]), num(cal["sustained_spread_median"]),
+             num(cal["ratio"], "%.2f"),
+             "reliable" if cal["reliable"] else "**UNRELIABLE, conclusions degraded**"))
+    print("  speech %.1fs (%.0f%%) | steady energy %.1fs (%.0f%%) | silence %.1fs (%.0f%%)"
           % (speech, 100 * speech / total, sustained, 100 * sustained / total,
              silence, 100 * silence / total))
     print()
     if notes:
-        print("发现：")
+        print("Findings:")
         for n in notes:
             print("  " + n)
     else:
-        print("发现：此规则未发现候选，不代表转写完整或准确")
+        # "没找到"不等于"没有问题"——扫描只看能量结构，看不到内容对不对
+        print("Findings: this rule found no candidates — that does not mean the "
+              "transcript is complete or accurate")
 
     if args.out:
-        payload = {"schema_version": 1, "source_media": os.path.abspath(args.media),
+        payload = {"schema_version": 2, "source_media": os.path.abspath(args.media),
                    "covered_sec": round(total, 3),
-                   "params": {"silence_db": args.silence_db, "pause_min_sec": args.pause_min,
-                              "min_sustained_sec": args.min_sustained},
+                   "params": {"silence_db": silence_db,
+                              "pause_min_sec": args.pause_min,
+                              "min_sustained_sec": args.min_sustained,
+                              "min_silence_sec": args.min_silence,
+                              "merge_gap_sec": args.merge_gap},
+                   "calibration": cal,
                    "regions": regions, "findings": notes}
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
             f.write("\n")
-        print("\n已写出：%s" % args.out)
+        print("\nWrote: %s" % args.out)
     return 0
 
 

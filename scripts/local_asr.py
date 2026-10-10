@@ -74,8 +74,8 @@ def parse_whisper_json(path: Path, offset: float = 0.0, chunk_id: str = "c0001")
                 if value.endswith("ms"):
                     return float(value[:-2]) / 1000
             value = float(value)
-            # Numeric start/end are seconds; explicit offsets are milliseconds.
-            return value
+            # whisper.cpp JSON commonly uses seconds; tolerate millisecond fields.
+            return value / 1000 if value > 10000 else value
         offsets = row.get("offsets", {})
         timestamps = row.get("timestamps", {})
         start = float(offsets.get("from", 0)) / 1000 if offsets else sec("offsets_start")
@@ -132,6 +132,7 @@ def write_outputs(outdir: Path, media: Path, probe_data: dict, segments: list[di
 
 
 def doctor(args: argparse.Namespace) -> int:
+    """环境自检。**只检查环境**——模型能不能真的加载，要跑一次真实短转写才算数。"""
     failed = False
     for label, name, override in [("ffmpeg", "ffmpeg", args.ffmpeg), ("ffprobe", "ffprobe", args.ffprobe), ("whisper-cli", "whisper-cli", args.whisper_cli)]:
         path = require_program(name, override)
@@ -139,9 +140,12 @@ def doctor(args: argparse.Namespace) -> int:
             print(f"{label}: MISSING", file=sys.stderr)
             failed = True
             continue
-        # ffmpeg / ffprobe 用 -version，whisper-cli 只认 --version
+        # ffmpeg / ffprobe 用 -version，whisper-cli 只认 --version。
+        # 超时给足：机器被别的重任务占满时，whisper-cli 冷启动实测要 20 秒以上，
+        # 卡太紧会把「机器忙」误报成「工具坏了」。
         try:
-            p = subprocess.run([path, "--help"] if label == "whisper-cli" else [path, "-version"], capture_output=True, text=True, timeout=15)
+            p = subprocess.run([path, "--version"] if label == "whisper-cli" else [path, "-version"],
+                               check=False, text=True, capture_output=True, timeout=args.tool_timeout)
         except (OSError, subprocess.TimeoutExpired) as error:
             print(f"{label}: {error}", file=sys.stderr)
             failed = True
@@ -149,7 +153,7 @@ def doctor(args: argparse.Namespace) -> int:
         failed = failed or p.returncode != 0
         print(f"{label}: {path}\n{(p.stdout or p.stderr).splitlines()[0] if (p.stdout or p.stderr) else ''}")
     if not args.model:
-        print("model: MISSING", file=sys.stderr)
+        print("model: MISSING (pass --model or set LOCAL_ASR_MODEL)", file=sys.stderr)
         failed = True
     else:
         model = Path(args.model).expanduser()
@@ -163,8 +167,6 @@ def doctor(args: argparse.Namespace) -> int:
 
 
 def transcribe(args: argparse.Namespace) -> int:
-    if args.start < 0 or any(v is not None and v <= 0 for v in (args.duration, args.chunk_seconds, args.threads)):
-        raise SystemExit("start must be non-negative; duration, chunk-seconds and threads must be positive")
     if not args.model:
         raise SystemExit("--model is required (or set LOCAL_ASR_MODEL)")
     media = Path(args.media).expanduser().resolve()
@@ -175,11 +177,17 @@ def transcribe(args: argparse.Namespace) -> int:
     ffmpeg = require_program("ffmpeg", args.ffmpeg); ffprobe = require_program("ffprobe", args.ffprobe); whisper = require_program("whisper-cli", args.whisper_cli)
     if not all([ffmpeg, ffprobe, whisper]):
         raise SystemExit("ffmpeg, ffprobe and whisper-cli are required")
+    # 入参先校验：负数或零会让下面的分块循环算出一堆空块，或者干脆跑出天文数字的区间
+    if args.start < 0 or any(v is not None and v <= 0
+                             for v in (args.duration, args.chunk_seconds, args.threads)):
+        raise SystemExit("start must be non-negative; duration, chunk-seconds and threads must be positive")
+
     outdir.mkdir(parents=True, exist_ok=True)
     p = probe(ffprobe, media)
     total_duration = float(p.get("format", {}).get("duration", 0) or 0)
     if total_duration <= 0 or args.start >= total_duration:
         raise SystemExit("requested start must fall inside a media file of known positive duration")
+    # 只有画面没有声音的文件（音视频分离时很容易拿错）——这里要说清楚，别等 whisper 报怪错
     if not any(x.get("codec_type") == "audio" for x in p.get("streams", [])):
         raise SystemExit("source media has no audio stream")
     requested_end = min(total_duration, args.start + args.duration) if args.duration else total_duration
@@ -188,26 +196,14 @@ def transcribe(args: argparse.Namespace) -> int:
     chunk_seconds = args.chunk_seconds or (requested_end - args.start)
     chunks = []
     cursor = args.start
-    # Container duration can exceed the final decodable audio by a few milliseconds.
-    # Do not pass such an empty tail to whisper-cli as a separate WAV chunk.
     while cursor < requested_end - 1e-6:
+        # 容器时长常比最后一段可解码音频多几毫秒。别把这样的空尾巴当独立 WAV 块喂给
+        # whisper-cli——整块落在静音上时它会输出「请不吝点赞 订阅 转发」这类字幕模板。
         if chunks and requested_end - cursor < 0.1:
             break
         end = min(requested_end, cursor + chunk_seconds)
         chunks.append((cursor, end))
         cursor = end
-    identity = {"source_sha256": sha256(media), "model_sha256": sha256(model),
-                "language": args.language, "translate": args.translate, "start": args.start,
-                "end": requested_end, "chunk_seconds": chunk_seconds, "no_gpu": args.no_gpu,
-                "threads": args.threads, "whisper_cli": str(whisper)}
-    identity_path = outdir / "resume-identity.json"
-    raw_exists = any((outdir / "raw").glob("chunk-*.json"))
-    if args.resume and raw_exists:
-        if not identity_path.is_file() or json.loads(identity_path.read_text()) != identity:
-            raise SystemExit("resume input/model/settings do not match; use a new output directory")
-    elif raw_exists:
-        raise SystemExit("output already contains transcription; use --resume or a new directory")
-    identity_path.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
     (outdir / "chunks").mkdir(exist_ok=True)
     (outdir / "raw").mkdir(exist_ok=True)
     (outdir / "chunks" / "plan.json").write_text(json.dumps({"source_start": args.start, "source_end": requested_end, "chunk_seconds": chunk_seconds, "chunks": [{"id": i + 1, "start": a, "end": b} for i, (a, b) in enumerate(chunks)]}, indent=2) + "\n", encoding="utf-8")
@@ -228,7 +224,7 @@ def transcribe(args: argparse.Namespace) -> int:
                 if result.returncode:
                     raise SystemExit(result.stderr.strip() or f"whisper-cli failed on chunk {index}")
             all_segments.extend(parse_whisper_json(raw_json, chunk_start, f"c{index:04d}"))
-    write_outputs(outdir, media, p, all_segments, outdir / "raw" / "chunk-0001.json", {"engine": "whisper.cpp", "model": str(model), "model_sha256": sha256(model), "language": args.language, "source_start_sec": args.start, "source_duration_sec": args.duration, "chunk_seconds": chunk_seconds, "resume": args.resume, "no_gpu": args.no_gpu, "translate": args.translate, "threads": args.threads}, time.monotonic() - started)
+    write_outputs(outdir, media, p, all_segments, outdir / "raw" / "chunk-0001.json", {"engine": "whisper.cpp", "model": str(model), "model_sha256": sha256(model), "language": args.language, "source_start_sec": args.start, "source_duration_sec": args.duration, "chunk_seconds": chunk_seconds, "resume": args.resume, "no_gpu": args.no_gpu}, time.monotonic() - started)
     print(outdir)
     return 0
 
@@ -242,6 +238,9 @@ def main() -> int:
     common.add_argument("--ffprobe", default=os.getenv("LOCAL_ASR_FFPROBE"))
     common.add_argument("--whisper-cli", default=os.getenv("LOCAL_ASR_WHISPER_CLI"))
     common.add_argument("--model", default=os.getenv("LOCAL_ASR_MODEL"))
+    common.add_argument("--tool-timeout", type=float, default=60.0,
+                        help="seconds to wait for a tool version check (default 60; "
+                             "a busy machine can take >20s just to start whisper-cli)")
 
     parser = argparse.ArgumentParser(description="Local offline ASR wrapper for whisper.cpp")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -268,9 +267,4 @@ def main() -> int:
     return args.func(args)
 
 
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (OSError, ValueError) as error:
-        print(str(error), file=sys.stderr)
-        raise SystemExit(2)
+if __name__ == "__main__": raise SystemExit(main())

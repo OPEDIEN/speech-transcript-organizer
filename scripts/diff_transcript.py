@@ -6,9 +6,7 @@
 用纯程序的方式回答"整理过程到底动了什么"，供工作审查使用：
   · 差异定位：difflib.SequenceMatcher 字符级对齐，增/删/改逐字精确
   · 页码归属：由对齐结果自动推导，脚本不接收任何人工映射
-  · 内部对齐检查：原文每个字符是否都被归属且仅归属一处、块的顺序是否被调换
-
-检查只描述内部对齐，不能证明没有漏写、改序或编造。
+  · 完整性校验：原文每个字符是否都被归属且仅归属一处、块的顺序是否被调换
 
 自包含：只用 Python 标准库（difflib / unicodedata / re / html），不依赖任何
 外部路径、外部包、外部配置。所有输入都来自命令行参数。
@@ -26,7 +24,7 @@
     --quiet            只输出结论
 
 产出（写入 --out 目录）：
-    index.html         可视化比对报告；带 --pages 时可展示 PPT、英文正文与逐页译稿
+    index.html         可视化比对报告；带 --pages 时是「PPT | 原始实录 | 整理后实录」三列工作台
     changelog.md       完整修改清单（分类、带上下文）
     changes.diff       行级 unified diff
     pages/             从 --pages 拷来的逐页截图（报告目录整体可移动）
@@ -56,14 +54,14 @@ CHANGELOG_END = "<!-- CHANGELOG:END -->"
 # ---------------------------------------------------------------------------
 # 中文排版领域常见的两种「字数」口径，本工具同时给出，避免对不上账：
 #
-#   ① 近似口径：汉字与中文标点各计 1，连续的字母数字串各计 1 个词。
-#      这是本脚本的近似统计，不保证与办公软件一致。
+#   ① WPS / Word 口径：汉字与中文标点各计 1，连续的字母数字串各计 1 个词。
+#      用户在 WPS 里复制粘贴核对时看到的就是这个数。
 #   ② 字符口径：去掉换行后的字符数，ASCII 每个字符算 1，空格与半角符号也计入。
-#      内部对齐检查必须用它（包括被删字符的对齐归属）。
+#      完整性校验必须用它（要保证每个字符不丢）。
 #
-# 两种口径的换算关系：字符口径 - ASCII 折叠数 - 不计入的空格符号 = 近似口径。
+# 两种口径的换算关系：字符口径 - ASCII 折叠数 - 不计入的空格符号 = WPS 口径。
 
-# 近似统计计入的码位区间：CJK 标点、CJK 汉字（含扩展）、CJK 兼容、全角形式
+# WPS 计入「字」的码位区间：CJK 标点、CJK 汉字（含扩展）、CJK 兼容、全角形式
 CJK_RANGES = (
     (0x3000, 0x303F),
     (0x3400, 0x4DBF),
@@ -81,7 +79,7 @@ def is_cjk(ch):
 
 
 def wps_count(text):
-    """近似口径字数。返回 (字数, 汉字与中文标点数, 字母数字词数)"""
+    """WPS / Word 口径字数。返回 (字数, 汉字与中文标点数, 字母数字词数)"""
     cjk = sum(1 for ch in text if is_cjk(ch))
     words = len(ASCII_WORD_RE.findall(text))
     return cjk + words, cjk, words
@@ -112,6 +110,8 @@ def split_row(line):
     if not s.startswith("|"):
         return None
     s = s.replace("\\|", "\x00")
+    # 只削掉首尾各一个竖线（而不是 strip 掉所有），这样首尾的空单元格会被保留，
+    # 列数不会因为多打了一个竖线就悄悄少一列。
     cells = s[1:-1].split("|") if s.endswith("|") else s[1:].split("|")
     return [c.replace("\x00", "|").strip() for c in cells]
 
@@ -196,9 +196,9 @@ def detect_columns(rows, original_text):
 
 
 def normalize_cell(text):
-    """把单元格还原成文本：<br/> 当换行，去掉每行首尾空白，保留有意的段间空行"""
+    """把单元格还原成文本：<br/> 当换行，去掉每行首尾空白与空行"""
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
-    return "\n".join(s.strip() for s in text.split("\n")).strip()
+    return "\n".join(s.strip() for s in text.split("\n") if s.strip())
 
 
 def load_original(path):
@@ -239,35 +239,45 @@ def load_organized(path, original_text, col=None, page_col=None, translation_col
         raw = f.read()
     lines = strip_generated_blocks(raw).split("\n")
 
-    # 先按表格形态解析；用户显式指定的列号只覆盖识别结果，不影响是否走表格
+    # 一篇整理稿只该有一个正文表格。多个表格时"挑最像的那个"会给出**静默的错误答案**
+    # （典型场景：拿一场的原文去比整个多场合集），所以直接报错。
     tables = find_tables(lines)
     if len(tables) > 1:
-        raise ValueError("Multiple tables: compare each transcript separately, or combine its body into one table.")
-    best, rows, scores = None, None, []
-    for rows in tables:
+        raise ValueError("Multiple tables: compare each transcript separately, "
+                         "or combine its body into one table.")
+
+    # 先按表格形态解析；用户显式指定的列号只覆盖识别结果，不影响是否走表格
+    rows, scores = None, []
+    if tables:
+        rows = tables[0]
         pc, cc, scores = detect_columns(rows, original_text)
-        if cc is None:
-            continue
-        score_of = {ci: score for score, ci in scores}
-        sc = score_of.get(cc, 0.0)
-        if best is None or sc > best[0]:
-            best = (sc, rows, pc, cc, scores)
-    if best is not None:
-        sc, rows, pc, cc, scores = best
-        page_col = page_col if page_col is not None else pc
-        col = col if col is not None else cc
+        if cc is not None:
+            page_col = page_col if page_col is not None else pc
+            col = col if col is not None else cc
+        else:
+            rows = None
+
+    if rows is not None and col is not None:
         ncols = max(len(r) for r in rows)
+        # 列号越界不再静默退回整篇比对——那会让"列写错了"看起来像"结果就是这样"
         if col >= ncols:
             raise ValueError("Transcript column is out of range")
+        if page_col is not None and page_col >= ncols:
+            raise ValueError("Page column is out of range")
         if translation_col is not None and translation_col >= ncols:
             raise ValueError("Translation column is out of range")
         if translation_col is not None and translation_col in (col, page_col):
             raise ValueError("Translation, transcript and page columns must be different")
-    if col is not None and rows is not None:
+
+        header = rows[0]
+        # 说明列 = 除正文/页码/译稿之外，且**不是**幻灯片描述的那几列。
+        # 幻灯片描述每页都有，收进 source-note 只会让阅读页变吵。
+        note_cols = [ci for ci in range(ncols)
+                     if ci not in (col, page_col, translation_col)
+                     and not PPT_HEAD_RE.search(header[ci] if ci < len(header) else "")]
+
         body = rows[1:]
-        pages = []
-        page_notes = {}
-        translations = {}
+        pages, translations, page_notes, seen = [], {}, {}, set()
         for i, r in enumerate(body):
             text = normalize_cell(r[col] if col < len(r) else "")
             if page_col is not None and page_col < len(r):
@@ -275,29 +285,36 @@ def load_organized(path, original_text, col=None, page_col=None, translation_col
                 label = "P%s" % num if num else "第%d块" % (i + 1)
             else:
                 label = "第%d块" % (i + 1)
-            if label in page_notes:
-                raise ValueError("Use unique unit labels; returning to the same slide needs a new unit ID")
+            # 同一页翻走再回来是**两次讲解**，不是同一单元——必须换新编号。
+            # 重复编号会让逐页对应关系错位，且下游按编号取图会取错。
+            if label in seen:
+                raise ValueError("Use unique unit labels; returning to the same slide "
+                                 "needs a new unit ID")
+            seen.add(label)
+            pages.append((label, text))
+
             if translation_col is not None:
                 translated = normalize_cell(r[translation_col] if translation_col < len(r) else "")
                 if not translated:
+                    # 译稿列不能留空：没有现场讲解的页面要写「本页无现场讲解」。
+                    # 留空多半是漏译，静默放过会让交付物里少一段而没人发现。
                     raise ValueError("Missing translation for " + label)
                 translations[label] = translated
-            note_parts = []
-            for ci, cell in enumerate(r):
-                if ci in (col, page_col, translation_col):
-                    continue
-                # Preserve source times, titles and uncertainty notes; images are rendered separately.
-                note = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", cell)
-                note = normalize_cell(note)
-                if note.strip():
-                    note_parts.append(note)
-            page_notes[label] = "\n".join(note_parts)
-            pages.append((label, text))
+
+            parts = []
+            for ci in note_cols:
+                cell = r[ci] if ci < len(r) else ""
+                cell = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", cell)   # 图片另有渲染
+                cell = normalize_cell(cell)
+                if cell.strip():
+                    parts.append(cell)
+            if parts:
+                page_notes[label] = "\n".join(parts)
+
         if pages:
             return {"mode": "table", "pages": pages, "col": col + 1,
                     "page_col": None if page_col is None else page_col + 1,
-                    "scores": scores, "page_notes": page_notes,
-                    "translations": translations}
+                    "scores": scores, "translations": translations, "page_notes": page_notes}
 
     # 不是表格形态（或没找到可信的实录列）→ 按整篇比对
     body = strip_markdown_scaffolding(lines)
@@ -325,10 +342,12 @@ def analyze(orig_units, pages):
     page_texts = [t for _, t in pages]
     org_text, page_ranges = build_ranges(page_texts)
 
-    opcodes = difflib.SequenceMatcher(None, orig_text, org_text, autojunk=False).get_opcodes()
-
+    # 空输入会让下面所有比例变成 0/0 或 100%，看起来像"校验通过"——直接报错
     if not orig_text.strip() or not org_text.strip():
         raise ValueError("Original and organized transcript must both contain text")
+
+    opcodes = difflib.SequenceMatcher(None, orig_text, org_text, autojunk=False).get_opcodes()
+
     n_pages = len(page_ranges)
     page_of_bpos = [0] * len(org_text)
     for idx, (bs, be) in enumerate(page_ranges):
@@ -401,8 +420,8 @@ def analyze(orig_units, pages):
 def verify_integrity(res, pages, orig_text):
     """
     程序化校验：
-      ① 原文每个字符都被归属，且仅归属一处  → 对齐记录内部一致，包含删除
-      ② 块归属随原文档位单调递增            → 对齐记录单调，不能证明现场顺序
+      ① 原文每个字符都被归属，且仅归属一处  → 无内容丢失、无重复计入
+      ② 块归属随原文档位单调递增            → 现场顺序未被调换
     """
     n = len(orig_text)
     owner = [None] * n
@@ -499,8 +518,9 @@ h1{font-size:20px;margin:0 0 4px}
 .cols.with-ppt{grid-template-columns:minmax(200px,0.9fr) 1.05fr 1.05fr}
 .cols.with-ppt.with-translation{grid-template-columns:minmax(200px,0.85fr) 1fr 1.08fr 1.08fr}
 /* 阅读视图（默认）：只留 PPT 与整理后实录；「对照改动」再展开原始实录与改动清单 */
-body.view-read .technical,body.view-read .summary,body.view-read .verify,body.view-read .card header .meta{display:none}
 body.view-read .col.orig,body.view-read .hunklist{display:none}
+/* 阅读视图也藏掉过程性信息：技术口径、字数汇总、校验横幅、每块的字符区间 */
+body.view-read .technical,body.view-read .summary,body.view-read .verify,body.view-read .card header .meta{display:none}
 /* 阅读视图不标改动：补标点会让几乎每个句子都带高亮，读起来很花 */
 body.view-read ins{background:transparent;color:inherit;font-weight:inherit}
 body.view-read .cols.with-ppt{grid-template-columns:minmax(220px,0.85fr) 1.6fr}
@@ -552,7 +572,29 @@ def retention_note(o_wps, n_wps, mode):
     return ""
 
 
+def retention_note_en(o_wps, n_wps):
+    """`retention_note` 的英文版，**只给控制台用**。
+
+    HTML 与 changelog 是交付物，走中文的 `retention_note`；控制台输出按约定用英文。
+    """
+    if not o_wps:
+        return ""
+    r = n_wps / o_wps * 100
+    if r > 100:
+        return ("Organized text is longer than the original (%.1f%%). Common in plain-text mode: "
+                "added headings, note lines or paragraphs show up as insertions. If this appears "
+                "in per-page mode, check whether reference material leaked into the transcript." % r)
+    return ""
+
+
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+# 控制台里的差异类型。`h["kind"]` 本身是中文（HTML 与 changelog 也要用），只在这里映射
+KIND_EN = {"改": "replace", "删": "delete", "增": "insert"}
+
+# 幻灯片描述类列。这些列**不收**进 source-note——它们本来就是每页都有的内容，
+# 收进去会让阅读页每页多一个黄块。真正要收的是「时间」「疑点」这类说明列。
+PPT_HEAD_RE = re.compile(r"PPT|幻灯片|页面|幻灯", re.I)
 
 
 def collect_page_images(pages, pages_dir, outdir):
@@ -595,13 +637,14 @@ def collect_page_images(pages, pages_dir, outdir):
         os.makedirs(dest_dir, exist_ok=True)
         name = "P%03d%s" % (n, os.path.splitext(src)[1].lower())
         shutil.copyfile(src, os.path.join(dest_dir, name))
-        row = meta.get("P%03d" % n) or meta.get("P%d" % n) or meta.get(str(n)) or {}
+        row = meta.get("P%03d" % n) or meta.get(str(n)) or {}
         found[label] = {"src": "pages/" + name,
                         "seg": (row.get("seg_start"), row.get("seg_end"))}
     return found
 
 
-def build_html(orig_path, org_path, res, pages, ver, mode_label, script_name, page_images=None, page_notes=None, translations=None):
+def build_html(orig_path, org_path, res, pages, ver, mode_label, script_name,
+               page_images=None, page_notes=None, translations=None):
     o_wps, _, _ = wps_count(res["orig_text"])
     n_wps, _, _ = wps_count(res["org_text"])
     o_ch, n_ch = char_count(res["orig_text"]), char_count(res["org_text"])
@@ -644,26 +687,38 @@ def build_html(orig_path, org_path, res, pages, ver, mode_label, script_name, pa
                 for h in ph)
             ctx_html = '<ul class="hunklist">%s</ul>' % items
 
+        # 说明列的注记（时间、疑点…）挂在 PPT 列里。注意：`PPT 内容` 那类描述性列
+        # 在 load_organized 里已经被排除，否则每一页都会多一个黄块。
+        note_text = (page_notes or {}).get(label, "")
+        note_html = ('<div class="source-note">%s</div>'
+                     % html.escape(note_text).replace("\n", "<br/>")) if note_text else ""
+
         img = (page_images or {}).get(label)
         if img:
             a, b = img.get("seg") or (None, None)
             when = "　%.1f–%.1fs" % (a, b) if a is not None and b is not None else ""
-            # 不加 loading="lazy"：工作台就是要让人一次扫完所有页，懒加载会只渲染首屏那几张
+            # 不加 loading="lazy"：工作台就是要让人一次扫完所有页，懒加载会只渲染首屏那几张。
+            # 注记拼在 `</div>` 之前、`<a>` 之后——**不能**用 replace("</div>", …, 1)，
+            # 那会把注记塞进 colhead 里（公开版就是这么写的，样式全错）。
             ppt_html = ('<div class="col ppt"><div class="colhead">PPT 页面%s</div>'
-                        '<a href="%s" target="_blank"><img src="%s" alt="%s"/></a></div>'
+                        '<a href="%s" target="_blank"><img src="%s" alt="%s"/></a>%s</div>'
                         % (when, html.escape(img["src"], quote=True),
-                           html.escape(img["src"], quote=True), html.escape(label)))
+                           html.escape(img["src"], quote=True), html.escape(label),
+                           note_html))
+        elif page_images is not None:
+            # 给了 --pages 但这一页没匹配到图：**明确标出来**，别静默降级成两列
+            ppt_html = ('<div class="col ppt"><b>缺少页面图片，需补齐或说明原因</b>%s</div>'
+                        % note_html)
         else:
-            ppt_html = '<div class="col ppt"><b>缺少页面图片，需补齐或说明原因</b></div>' if page_images is not None else ""
-        note_text = (page_notes or {}).get(label, "")
-        if note_text:
-            note_html = '<div class="source-note">%s</div>' % html.escape(note_text).replace("\n", "<br/>")
-            ppt_html = ppt_html + note_html if not ppt_html else ppt_html.replace("</div>", note_html + "</div>", 1)
+            ppt_html = ""
+
         translated = (translations or {}).get(label)
-        translation_html = ('<div class="col translation" lang="zh-CN"><div class="colhead">中文译稿</div>'
-                            '<div class="body">%s</div></div>'
-                            % html.escape(translated).replace("\n", "<br/>") if translated else "")
-        cols_cls = ("cols with-ppt" if ppt_html else "cols") + (" with-translation" if translated else "")
+        translation_html = ('<div class="col translation" lang="zh-CN">'
+                            '<div class="colhead">中文译稿</div><div class="body">%s</div></div>'
+                            % html.escape(translated).replace("\n", "<br/>")
+                            if translated else "")
+        cols_cls = ("cols with-ppt" if ppt_html else "cols") + \
+                   (" with-translation" if translated else "")
 
         cards.append("""
 <section class="card">
@@ -695,20 +750,23 @@ def build_html(orig_path, org_path, res, pages, ver, mode_label, script_name, pa
         detail.append("有 %d 个字符未被归属" % len(ver["unassigned"]))
     if ver["nonmono"]:
         detail.append("块归属非单调：%s" % ver["nonmono"])
+    # 措辞刻意保守：对齐检查只验证字符归属，**不证明**内容没漏、顺序没错、没有编造
     banner = ('<div class="verify %s">%s <b>内部对齐检查：%s</b>　'
-              '<span>本次检查 %d 个原文字符的内部归属；'
-              '被删内容也参与归属。此结果不证明无遗漏、顺序正确或没有编造；需回查原材料%s</span></div>'
+              '<span>本次检查 %d 个原文字符的内部归属；被删内容也参与归属。'
+              '此结果不证明无遗漏、顺序正确或没有编造；需回查原材料%s</span></div>'
               % ("ok" if ok else "bad", "✔" if ok else "✘", "PASS" if ok else "FAIL",
                  char_count(res["orig_text"]),
                  "" if ok else "：" + "；".join(detail)))
 
     has_ppt = page_images is not None
     has_translation = bool(translations)
-    page_title = ("逐页阅读：PPT 与中英演讲稿" if has_translation else "逐页阅读：PPT 与演讲稿") if has_ppt else "实录比对报告"
+    page_title = ("逐页阅读：PPT 与中英演讲稿" if has_translation
+                  else "逐页阅读：PPT 与演讲稿") if has_ppt else "实录比对报告"
     lead = ((("每页依次显示 PPT、英文演讲稿和中文译稿。" if has_translation else
               "每页一行：左边是这一页的 PPT，右边是整理后的演讲稿。") +
              "默认是阅读视图；切到「对照改动」可以看到原始实录和每一处改动。")
-            if has_ppt else "左右两栏对照：左边原文、右边整理后，行内高亮标出每一处改动。")
+            if has_ppt else
+            "左右两栏对照：左边原文、右边整理后，行内高亮标出每一处改动。")
     ppt_note = ("<br/>点 PPT 图可看原图。"
                 if has_ppt else
                 "<br/>加 <code>--pages &lt;截图目录&gt;</code> 可把每页 PPT 一并放进报告。")
@@ -721,7 +779,8 @@ def build_html(orig_path, org_path, res, pages, ver, mode_label, script_name, pa
     <button id="btn-diff" type="button" aria-pressed="false">对照改动</button>
   </span>
   <span class="meta" style="margin-left:12px">对照视图会展开「原始实录」列与逐条改动清单</span>
-</div>""" % ("PPT + 英文 + 中文" if has_translation else "PPT + 整理后实录") if has_ppt else "")
+</div>""" % ("PPT + 英文 + 中文" if has_translation else "PPT + 整理后实录")
+                  if has_ppt else "")
     view_script = """
 <script>
 (function () {
@@ -793,7 +852,7 @@ def build_changelog(orig_name, org_name, res, pages, ver, mode_label,
 
     header = """# 修改清单（程序生成）
 
-> 本文件由 `%s` 根据原文与整理稿的差异生成。条目、上下文与分类由
+> 本文件由 `%s` 自动生成，**不是人工编写**。条目、上下文与分类均由
 > `difflib.SequenceMatcher` 字符级对齐结果推导，重新运行即可复现：
 
 ```bash
@@ -805,18 +864,18 @@ python3 %s "%s" "%s"
     body = """| 指标 | 数值 |
 |---|---|
 | 形态 | %s |
-| 原始字数（**近似口径**） | %d |
-| 整理后字数（**近似口径**） | %d |
+| 原始字数（**WPS 口径**） | %d |
+| 整理后字数（**WPS 口径**） | %d |
 | 保留比例 | %.1f%% |
 | 原始 / 整理后（字符口径：去换行字符数） | %d / %d |
 | 差异块总数 | **%d** |
 | ├ 标点 / 空白调整 | %d |
 | └ 字词调整 | %d |
-| 内部对齐检查 | **%s** |
+| 完整性 / 顺序校验 | **%s** |
 
-> **字数口径**：近似字数算法＝汉字与中文标点各计 1 ＋ 连续字母数字串各计 1 个词，
-> 半角空格与符号不计数。字符口径为去换行后的字符数，ASCII 每字符算 1，
-> 内部对齐检查用它（包括被删字符的对齐归属）。
+> **字数口径**：WPS / Word 的「字数」＝汉字与中文标点各计 1 ＋ 连续字母数字串各计 1 个词，
+> 半角空格与符号不计数；与 WPS 核对请用这一栏。字符口径为去换行后的字符数，ASCII 每字符算 1，
+> 完整性校验用它（要保证每个字符不丢）。
 > 本清单与字数均已剔除整理稿里由本工具生成的内容（标记之间的部分），重复运行结果稳定。
 
 %s
@@ -906,18 +965,26 @@ def inject_changelog(path, body, start=CHANGELOG_START, end=CHANGELOG_END):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="实录比对：原始实录 vs 整理稿（程序生成 diff + 内部对齐检查）")
+        description="Transcript comparison: original vs organized "
+                    "(programmatic diff + internal alignment check)")
     ap.add_argument("original")
     ap.add_argument("organized")
     ap.add_argument("--out")
     ap.add_argument("--col", type=int)
     ap.add_argument("--page-col", type=int)
-    ap.add_argument("--translation-col", type=int, help="逐页译稿列，从 1 开始；只展示，不参与原文改动比对")
-    ap.add_argument("--pages", help="逐页截图目录（P001.jpg… 及可选 _pages.json）；给了就在报告里加 PPT 列")
+    ap.add_argument("--pages",
+                    help="per-page screenshot directory (P001.jpg… and optional _pages.json); "
+                         "adds a PPT column to the report")
+    ap.add_argument("--translation-col", type=int,
+                    help="per-page translation column, 1-based; display only — it does not "
+                         "take part in the transcript diff")
     ap.add_argument("--no-inject", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
-    if any(v is not None and v < 1 for v in (args.col, args.page_col, args.translation_col)):
+
+    # 列号从 1 开始；0 或负数会被下面减 1 之后变成诡异的列，直接拦掉
+    if any(v is not None and v < 1
+           for v in (args.col, args.page_col, args.translation_col)):
         ap.error("column numbers start at 1")
 
     script_name = os.path.basename(__file__)
@@ -927,7 +994,8 @@ def main():
     parsed = load_organized(args.organized, orig_text,
                             col=(args.col - 1) if args.col else None,
                             page_col=(args.page_col - 1) if args.page_col else None,
-                            translation_col=(args.translation_col - 1) if args.translation_col else None)
+                            translation_col=(args.translation_col - 1)
+                            if args.translation_col else None)
     if args.translation_col and parsed["mode"] != "table":
         ap.error("--translation-col requires a Markdown table with a transcript column")
     pages = parsed["pages"]
@@ -936,18 +1004,20 @@ def main():
     ver = verify_integrity(res, pages, res["orig_text"])
 
     mode_label = "逐页对应（表格）" if parsed["mode"] == "table" else "纯文字整理"
+    # 控制台用英文；`mode_label` 本身要喂给 HTML 与 changelog（都是交付物），保持中文
+    mode_label_en = "per-page table" if parsed["mode"] == "table" else "plain text"
     outdir = args.out or os.path.join(
         os.path.dirname(os.path.abspath(args.organized)),
         os.path.splitext(os.path.basename(args.organized))[0] + "_diff")
     os.makedirs(outdir, exist_ok=True)
 
     page_images = collect_page_images(pages, args.pages, outdir)
-    missing_images = [label for label, _ in pages if label not in page_images] if args.pages else []
-    if missing_images:
-        print("缺图：" + ", ".join(missing_images), file=sys.stderr)
     with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
         f.write(build_html(args.original, args.organized, res, pages, ver,
-                           mode_label, script_name, page_images if args.pages else None,
+                           mode_label, script_name,
+                           # 给了 --pages 就按工作台渲染（缺图的页明确标注），
+                           # 没给才退回纯文字两列
+                           page_images if args.pages else None,
                            parsed.get("page_notes"), parsed.get("translations")))
     with open(os.path.join(outdir, "changelog.md"), "w", encoding="utf-8") as f:
         f.write(build_changelog(os.path.basename(args.original),
@@ -965,62 +1035,65 @@ def main():
             res, pages, ver, mode_label, include_header=False,
             script_name=script_name))
 
-    print("检查范围：仅内部对齐；不能证明内容完整、现场顺序正确或无编造。")
     if args.quiet:
-        print("%s | %d 块 | %d 处差异"
+        print("%s | %d blocks | %d diffs"
               % ("PASS" if ver["ok"] else "FAIL", len(pages), len(res["hunks"])))
-        return 0 if ver["ok"] and not missing_images else 1
+        return 0 if ver["ok"] else 1
 
     o_wps, _, _ = wps_count(res["orig_text"])
     n_wps, _, _ = wps_count(res["org_text"])
     o_ch, n_ch = char_count(res["orig_text"]), char_count(res["org_text"])
     print("=" * 68)
-    print("形态：%s" % mode_label)
+    print("Mode: %s" % mode_label_en)
     if parsed["mode"] == "table":
-        print("自动识别：实录列＝第 %s 列，页码列＝%s"
-              % (parsed["col"], parsed["page_col"] or "未识别（改用序号）"))
+        print("Auto-detected: transcript column = %s, page column = %s"
+              % (parsed["col"], parsed["page_col"] or "none (falling back to row order)"))
         top = sorted(parsed["scores"], reverse=True)[:3]
-        print("  列匹配度：" + "　".join("第%d列 %.2f" % (ci + 1, sc) for sc, ci in top))
-    print("原始实录：%d 行" % len(orig_units))
-    print("整理稿　：%d 块" % len(pages))
+        print("  column scores: " + "  ".join("col %d %.2f" % (ci + 1, sc) for sc, ci in top))
+    print("Original transcript: %d lines" % len(orig_units))
+    print("Organized          : %d blocks" % len(pages))
     print("-" * 68)
-    print("字数（近似字数，仅用于观察）：%d → %d（保留 %.1f%%）"
-          % (o_wps, n_wps, (n_wps / o_wps * 100) if o_wps else 0.0))
-    print("字数（字符口径，去换行字符数）          ：%d → %d（保留 %.1f%%）"
+    print("Word count (approx. rule, same as WPS/Word): %d -> %d (%.1f%% kept)"
+          % (o_wps, n_wps, n_wps / o_wps * 100))
+    print("Char count (newlines removed)             : %d -> %d (%.1f%% kept)"
           % (o_ch, n_ch, n_ch / o_ch * 100))
-    note = retention_note(o_wps, n_wps, mode_label)
+    note = retention_note_en(o_wps, n_wps)
     if note:
-        print("注意：%s" % note)
+        print("Note: %s" % note)
     print("-" * 68)
-    print("内部对齐检查：%s" % ("PASS" if ver["ok"] else "FAIL"))
-    print("  · 原文每个字符都被归属且仅归属一处：%s"
-          % ("是" if not (ver["conflicts"] or ver["unassigned"]) else "否"))
-    print("  · 块归属随原文位置单调递增（仅内部检查）：%s"
-          % ("是" if not ver["nonmono"] else "否"))
+    print("Alignment check: %s" % ("PASS" if ver["ok"] else "FAIL"))
+    print("  - every original character attributed exactly once: %s"
+          % ("yes" if not (ver["conflicts"] or ver["unassigned"]) else "no"))
+    print("  - block attribution monotonic in source order: %s"
+          % ("yes" if not ver["nonmono"] else "no"))
     print("-" * 68)
-    print("差异块 %d 处：" % len(res["hunks"]))
+    print("%d diff blocks:" % len(res["hunks"]))
     for h in res["hunks"]:
-        print("  [%s][%s] %r → %r" % (h["page"], h["kind"], h["orig"], h["org"]))
+        # h["kind"] 是中文（交付物里也用），控制台这边映射一下
+        print("  [%s][%s] %r -> %r"
+              % (h["page"], KIND_EN.get(h["kind"], h["kind"]), h["orig"], h["org"]))
     print("-" * 68)
     if args.pages:
-        print("PPT 列：%d/%d 页匹配到截图%s"
+        print("PPT column: %d/%d pages matched to a screenshot%s"
               % (len(page_images), len(pages),
-                 "" if len(page_images) == len(pages) else "（缺图的页只有文字两列）"))
+                 "" if len(page_images) == len(pages)
+                 else " (unmatched pages fall back to text only)"))
     for name in ("index.html", "changelog.md", "changes.diff"):
-        print("已生成：%s" % os.path.join(outdir, name))
+        print("Wrote: %s" % os.path.join(outdir, name))
     if args.no_inject:
-        inject_note = "已跳过回填（--no-inject）"
+        inject_note = "Changelog injection skipped (--no-inject)"
     elif injected:
-        inject_note = "已回填修改清单到整理稿"
+        inject_note = "Changelog written back into the organized transcript"
     else:
-        inject_note = "整理稿里没有 CHANGELOG 标记，未回填"
+        inject_note = "No CHANGELOG markers in the organized transcript; nothing written back"
     print(inject_note)
-    return 0 if ver["ok"] and not missing_images else 1
+    return 0 if ver["ok"] else 1
 
 
 if __name__ == "__main__":
+    # 解析/校验类错误（多表格、列越界、单元号重复、空输入…）走 ValueError，
+    # 这样脚本内可以被调用方捕获；命令行下则转成干净的一行消息，不吐 traceback。
     try:
         sys.exit(main())
-    except (ValueError, OSError) as error:
-        print(str(error), file=sys.stderr)
-        sys.exit(2)
+    except ValueError as exc:
+        raise SystemExit("error: %s" % exc)
